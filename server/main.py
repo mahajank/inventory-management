@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
+from datetime import datetime, timedelta
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
 app = FastAPI(title="Factory Inventory Management System")
@@ -80,6 +81,7 @@ class Order(BaseModel):
     actual_delivery: Optional[str] = None
     warehouse: Optional[str] = None
     category: Optional[str] = None
+    order_type: Optional[str] = None
 
 class DemandForecast(BaseModel):
     id: str
@@ -119,6 +121,45 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+# Enrichment data for demand forecast items (SKUs not in inventory)
+RESTOCK_ITEM_DATA = {
+    'WDG-001': {'unit_cost': 45.00,  'category': 'Actuators',      'warehouse': 'San Francisco'},
+    'BRG-102': {'unit_cost': 28.50,  'category': 'Actuators',      'warehouse': 'San Francisco'},
+    'GSK-203': {'unit_cost': 12.75,  'category': 'Sensors',        'warehouse': 'London'},
+    'MTR-304': {'unit_cost': 285.00, 'category': 'Actuators',      'warehouse': 'Tokyo'},
+    'FLT-405': {'unit_cost': 8.95,   'category': 'Sensors',        'warehouse': 'San Francisco'},
+    'VLV-506': {'unit_cost': 67.00,  'category': 'Controllers',    'warehouse': 'London'},
+    'PSU-501': {'unit_cost': 42.50,  'category': 'Power Supplies', 'warehouse': 'San Francisco'},
+    'SNR-420': {'unit_cost': 35.00,  'category': 'Sensors',        'warehouse': 'Tokyo'},
+    'CTL-330': {'unit_cost': 125.00, 'category': 'Controllers',    'warehouse': 'San Francisco'},
+}
+
+class RestockingRecommendation(BaseModel):
+    id: str
+    item_sku: str
+    item_name: str
+    current_demand: int
+    forecasted_demand: int
+    trend: str
+    period: str
+    unit_cost: float
+    category: str
+    warehouse: str
+    recommended_quantity: int
+    total_cost: float
+    demand_growth: int
+
+class RestockingOrderItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_cost: float
+    category: str
+    warehouse: str
+
+class SubmitRestockingOrderRequest(BaseModel):
+    items: List[RestockingOrderItem]
 
 # API endpoints
 @app.get("/")
@@ -303,6 +344,72 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/restocking/recommendations", response_model=List[RestockingRecommendation])
+def get_restocking_recommendations():
+    """Return demand forecast items enriched with cost data, sorted by demand growth descending."""
+    inventory_by_sku = {item['sku']: item for item in inventory_items}
+    result = []
+    for forecast in demand_forecasts:
+        sku = forecast['item_sku']
+        inv = inventory_by_sku.get(sku, {})
+        enrichment = RESTOCK_ITEM_DATA.get(sku, {})
+        unit_cost = inv.get('unit_cost') or enrichment.get('unit_cost', 50.0)
+        category = inv.get('category') or enrichment.get('category', 'General')
+        warehouse = inv.get('warehouse') or enrichment.get('warehouse', 'San Francisco')
+        recommended_qty = forecast['forecasted_demand']
+        demand_growth = forecast['forecasted_demand'] - forecast['current_demand']
+        result.append({
+            'id': forecast['id'],
+            'item_sku': sku,
+            'item_name': forecast['item_name'],
+            'current_demand': forecast['current_demand'],
+            'forecasted_demand': forecast['forecasted_demand'],
+            'trend': forecast['trend'],
+            'period': forecast['period'],
+            'unit_cost': unit_cost,
+            'category': category,
+            'warehouse': warehouse,
+            'recommended_quantity': recommended_qty,
+            'total_cost': round(recommended_qty * unit_cost, 2),
+            'demand_growth': demand_growth,
+        })
+    result.sort(key=lambda x: x['demand_growth'], reverse=True)
+    return result
+
+@app.post("/api/restocking/orders", response_model=Order)
+def submit_restocking_order(request: SubmitRestockingOrderRequest):
+    """Create a restocking order from selected items and append it to the in-memory orders list."""
+    if not request.items:
+        raise HTTPException(status_code=400, detail="No items provided")
+    now = datetime.now()
+    expected_delivery = now + timedelta(days=14)
+    order_id = str(len(orders) + 1)
+    order_number = f"RST-{now.strftime('%Y%m%d%H%M%S')}"
+    total_value = round(sum(item.quantity * item.unit_cost for item in request.items), 2)
+    new_order = {
+        'id': order_id,
+        'order_number': order_number,
+        'customer': 'Internal Restock',
+        'items': [
+            {'sku': item.sku, 'name': item.name, 'quantity': item.quantity, 'unit_price': item.unit_cost}
+            for item in request.items
+        ],
+        'status': 'Submitted',
+        'order_date': now.isoformat(),
+        'expected_delivery': expected_delivery.isoformat(),
+        'total_value': total_value,
+        'warehouse': request.items[0].warehouse,
+        'category': request.items[0].category,
+        'order_type': 'restocking',
+    }
+    orders.append(new_order)
+    return new_order
+
+@app.get("/api/restocking/orders", response_model=List[Order])
+def get_restocking_orders():
+    """Return all submitted restocking orders."""
+    return [order for order in orders if order.get('order_type') == 'restocking']
 
 if __name__ == "__main__":
     import uvicorn
